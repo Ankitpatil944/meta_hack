@@ -1,0 +1,42 @@
+name: ai-code-review-env
+version: 0.1.0
+description: OpenEnv-compatible AI code review and bug reasoning environment with deterministic graders and patch validation.
+tags:
+  - openenv
+  - code-review
+  - bug-reasoning
+runtime:
+  framework: fastapi
+  host: 0.0.0.0
+  port: 7860
+entrypoint:
+  module: app
+  app: app
+api:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  tasks: GET /tasks
+  grader: POST /grader
+  baseline: GET /baseline
+models:
+  action: models.Action
+  observation: models.Observation
+  reward: models.Reward
+  state: models.EnvironmentState
+tasks:
+  - id: easy_keyword_preview
+    difficulty: easy
+    summary: Catch a regression where the ticket keyword preview returns only the first token.
+  - id: frontier_discount_rollup
+    difficulty: hard
+    summary: Resolve an edge-case pricing regression where oversized flat coupons create negative merchandise totals across checkout and receipt rendering.
+  - id: hard_feature_flags
+    difficulty: hard
+    summary: Resolve explicit false versus None semantics in feature-flag merges.
+  - id: medium_job_retry
+    difficulty: medium
+    summary: Detect that exhausted jobs are incorrectly re-queued for retries.
+hf_space:
+  sdk: docker
+  suggested_repo_id: openenv/ai-code-review-env
