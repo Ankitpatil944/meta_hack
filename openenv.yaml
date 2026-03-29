@@ -23,7 +23,7 @@ models:
   action: models.Action
   observation: models.Observation
   reward: models.Reward
-  state: models.EnvironmentState
+  state: models.PublicEnvironmentState
 tasks:
   - id: easy_keyword_preview
     difficulty: easy
@@ -34,6 +34,9 @@ tasks:
   - id: hard_feature_flags
     difficulty: hard
     summary: Resolve explicit false versus None semantics in feature-flag merges.
+  - id: hard_billing_suspension
+    difficulty: hard
+    summary: Resolve both the grace-period boundary and active-payment-plan exception in automated billing suspension.
   - id: medium_job_retry
     difficulty: medium
     summary: Detect that exhausted jobs are incorrectly re-queued for retries.

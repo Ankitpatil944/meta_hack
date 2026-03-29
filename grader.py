@@ -174,13 +174,17 @@ def evaluate_history(task: TaskSpec, history: List[HistoryEntry]) -> GraderRespo
 
         elif action_type == ActionType.SUGGEST_FIX:
             patch_valid, _ = validate_fix_patch(task, content)
+            has_diff = "diff --git" in content
             if not fix_correct and patch_valid:
                 fix_correct = True
                 score += 0.3
                 components["validated_fix"] = 0.3
+            elif not patch_valid and not has_diff and fix_explanation_matches(task, content):
+                score += 0.1
+                components["partial_fix_reasoning"] = components.get("partial_fix_reasoning", 0.0) + 0.1
             elif not patch_valid and not fix_explanation_matches(task, content):
-                score -= 0.2
-                components["invalid_fix"] = components.get("invalid_fix", 0.0) - 0.2
+                score -= 0.1
+                components["invalid_fix"] = components.get("invalid_fix", 0.0) - 0.1
 
         elif action_type == ActionType.ASK_FOR_CLARIFICATION:
             helpful = task.uncertainty_level == "high"

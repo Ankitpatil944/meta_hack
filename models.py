@@ -38,7 +38,10 @@ class HistoryEntry(BaseModel):
 
 class Observation(BaseModel):
     task_id: str
+    variant_id: str = "base"
     difficulty: str
+    uncertainty_level: str
+    review_hint: Optional[str] = None
     pr_title: str
     commit_message: str
     changed_files: List[str]
@@ -57,6 +60,7 @@ class Observation(BaseModel):
 class EnvironmentState(BaseModel):
     episode_id: Optional[str] = None
     task_id: Optional[str] = None
+    variant_id: Optional[str] = None
     difficulty: Optional[str] = None
     step_count: int = 0
     max_steps: int = 0
@@ -68,6 +72,24 @@ class EnvironmentState(BaseModel):
     clarification_requested: bool = False
     maintainer_replied: bool = False
     final_decision: Optional[str] = None
+    history: List[HistoryEntry] = Field(default_factory=list)
+    discussion_context: List[str] = Field(default_factory=list)
+    action_log: List[str] = Field(default_factory=list)
+    mistakes: List[str] = Field(default_factory=list)
+    reasoning_trace: List[str] = Field(default_factory=list)
+    cumulative_reward: float = 0.0
+    done: bool = False
+
+
+class PublicEnvironmentState(BaseModel):
+    episode_id: Optional[str] = None
+    task_id: Optional[str] = None
+    variant_id: Optional[str] = None
+    difficulty: Optional[str] = None
+    step_count: int = 0
+    max_steps: int = 0
+    clarification_requested: bool = False
+    maintainer_replied: bool = False
     history: List[HistoryEntry] = Field(default_factory=list)
     discussion_context: List[str] = Field(default_factory=list)
     action_log: List[str] = Field(default_factory=list)

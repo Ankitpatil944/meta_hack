@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Callable, Dict, List, Optional, Tuple
@@ -17,6 +17,7 @@ class TaskSpec:
     difficulty: str
     pr_title: str
     summary: str
+    review_hint: str
     commit_message: str
     changed_files: List[str]
     code_diff: str
@@ -28,8 +29,54 @@ class TaskSpec:
     files_before: Dict[str, str]
     expected_bug_keywords: List[str]
     expected_fix_keywords: List[str]
+    variant_id: str = "base"
     clarification_hints: Dict[str, str] = field(default_factory=dict)
     validator: Optional[Validator] = None
+
+
+@dataclass(frozen=True)
+class TaskVariantSpec:
+    variant_id: str
+    pr_title: Optional[str] = None
+    summary: Optional[str] = None
+    review_hint: Optional[str] = None
+    commit_message: Optional[str] = None
+    changed_files: Optional[List[str]] = None
+    code_diff_prefix: str = ""
+    code_diff_suffix: str = ""
+    test_results_prefix: str = ""
+    test_results_suffix: str = ""
+    issue_description: Optional[str] = None
+    clarification_hints: Optional[Dict[str, str]] = None
+
+
+def _materialize_variant(base: TaskSpec, variant: TaskVariantSpec) -> TaskSpec:
+    changed_files = list(base.changed_files)
+    if variant.changed_files is not None:
+        changed_files = variant.changed_files
+
+    clarification_hints = dict(base.clarification_hints)
+    if variant.clarification_hints:
+        clarification_hints.update(variant.clarification_hints)
+
+    code_diff_parts = [part for part in [variant.code_diff_prefix, base.code_diff, variant.code_diff_suffix] if part]
+    test_result_parts = [
+        part for part in [variant.test_results_prefix, base.test_results, variant.test_results_suffix] if part
+    ]
+
+    return replace(
+        base,
+        variant_id=variant.variant_id,
+        pr_title=variant.pr_title or base.pr_title,
+        summary=variant.summary or base.summary,
+        review_hint=variant.review_hint or base.review_hint,
+        commit_message=variant.commit_message or base.commit_message,
+        changed_files=changed_files,
+        code_diff="\n\n".join(code_diff_parts),
+        test_results="\n".join(test_result_parts),
+        issue_description=variant.issue_description if variant.issue_description is not None else base.issue_description,
+        clarification_hints=clarification_hints,
+    )
 
 
 def _load_module(module_name: str, file_path: Path) -> ModuleType:
@@ -122,12 +169,56 @@ def _validate_frontier(workspace: Path) -> Tuple[bool, str]:
     return True, "All capped-discount pricing tests passed."
 
 
+def _validate_suspension(workspace: Path) -> Tuple[bool, str]:
+    module = _load_module("task_hard_billing_suspension", workspace / "src" / "billing_suspension.py")
+    should_suspend_account = getattr(module, "should_suspend_account")
+
+    boundary_account = {
+        "invoice_status": "unpaid",
+        "overdue_days": 14,
+        "grace_days": 14,
+        "active_payment_plan": False,
+    }
+    if should_suspend_account(boundary_account) is not False:
+        return False, "Accounts exactly at the grace boundary should not be suspended yet."
+
+    plan_account = {
+        "invoice_status": "unpaid",
+        "overdue_days": 21,
+        "grace_days": 14,
+        "active_payment_plan": True,
+    }
+    if should_suspend_account(plan_account) is not False:
+        return False, "Accounts with an active payment plan must not be suspended."
+
+    overdue_account = {
+        "invoice_status": "unpaid",
+        "overdue_days": 21,
+        "grace_days": 14,
+        "active_payment_plan": False,
+    }
+    if should_suspend_account(overdue_account) is not True:
+        return False, "Accounts past grace with no payment plan should be suspended."
+
+    paid_account = {
+        "invoice_status": "paid",
+        "overdue_days": 40,
+        "grace_days": 14,
+        "active_payment_plan": False,
+    }
+    if should_suspend_account(paid_account) is not False:
+        return False, "Paid accounts must never be suspended."
+
+    return True, "All billing suspension tests passed."
+
+
 TASKS: Dict[str, TaskSpec] = {
     "easy_keyword_preview": TaskSpec(
         task_id="easy_keyword_preview",
         difficulty="easy",
         pr_title="Speed up keyword previews on ticket cards",
         summary="Reviewer must catch that the preview only returns the first cleaned keyword instead of the full summary.",
+        review_hint="Important: preserve all normalized tokens in the preview string, not just the first token.",
         commit_message="perf: short-circuit keyword preview generation for non-empty token lists",
         changed_files=["src/keyword_preview.py", "tests/test_keyword_preview.py"],
         code_diff="""diff --git a/src/keyword_preview.py b/src/keyword_preview.py
@@ -194,6 +285,7 @@ def test_preview_skips_empty_values() -> None:
         difficulty="medium",
         pr_title="Refactor retry queue selection for failed background jobs",
         summary="Reviewer must catch that the retry filter was inverted and now selects exhausted jobs instead of retryable ones.",
+        review_hint="Important: only failed jobs with remaining retry attempts should be returned.",
         commit_message="cleanup: simplify failed-job selection before queueing retries",
         changed_files=["src/job_retry.py", "tests/test_job_retry.py"],
         code_diff="""diff --git a/src/job_retry.py b/src/job_retry.py
@@ -268,6 +360,7 @@ def test_retry_selector_only_returns_failed_jobs_with_budget() -> None:
         difficulty="hard",
         pr_title="Unify feature-flag merge path for partial account updates",
         summary="Reviewer must reason about explicit false vs None semantics and may ask for clarification before deciding.",
+        review_hint="Important: False is a valid override and must not be ignored. None means keep the current value.",
         commit_message="refactor: reuse truthy merge logic for partial feature flag updates",
         changed_files=["src/feature_flags.py", "tests/test_feature_flags.py", "docs/account_patch_contract.md"],
         code_diff="""diff --git a/src/feature_flags.py b/src/feature_flags.py
@@ -348,6 +441,7 @@ true = explicitly enable the flag
         difficulty="hard",
         pr_title="Reuse flat-discount helper across checkout totals and receipt summary",
         summary="Reviewer must catch a subtle multi-file pricing bug where oversized flat coupons create impossible negative subtotals that only surface in an edge-case receipt path.",
+        review_hint="Important: flat discounts must never exceed subtotal, and shipping is applied after discounts.",
         commit_message="refactor: consolidate flat discount handling for checkout summary generation",
         changed_files=[
             "src/pricing_rollup.py",
@@ -453,11 +547,244 @@ def test_flat_coupon_is_capped_before_shipping() -> None:
         },
         validator=_validate_frontier,
     ),
+    "hard_billing_suspension": TaskSpec(
+        task_id="hard_billing_suspension",
+        difficulty="hard",
+        pr_title="Simplify overdue-account suspension checks in billing control loop",
+        summary=(
+            "Reviewer must catch that the refactor changed both the grace-period boundary and the payment-plan exception. "
+            "A boundary-only fix looks plausible from the failing test, but it still violates the billing contract."
+        ),
+        review_hint="Important: accounts exactly at the grace boundary should not suspend, and active payment plans override suspension.",
+        commit_message="cleanup: collapse billing suspension predicate into a single return statement",
+        changed_files=[
+            "src/billing_suspension.py",
+            "tests/test_billing_suspension.py",
+            "docs/billing_suspension_contract.md",
+        ],
+        code_diff="""diff --git a/src/billing_suspension.py b/src/billing_suspension.py
+index 87ac120..2af1cc1 100644
+--- a/src/billing_suspension.py
++++ b/src/billing_suspension.py
+@@ -1,5 +1,5 @@
+ def should_suspend_account(account: dict) -> bool:
+     if account["invoice_status"] != "unpaid":
+         return False
+-    return account["overdue_days"] > account["grace_days"] and not account.get("active_payment_plan", False)
++    return account["overdue_days"] >= account["grace_days"]
+
+diff --git a/docs/billing_suspension_contract.md b/docs/billing_suspension_contract.md
+index d4ac993..d4ac993 100644
+--- a/docs/billing_suspension_contract.md
++++ b/docs/billing_suspension_contract.md
+@@ -1,4 +1,4 @@
+ Suspension contract:
+ - suspend only when unpaid invoices are past the grace window
+ - accounts exactly at the grace boundary remain active until the next day
+ - active payment plans pause automated suspension
+""",
+        test_results="""FAILED tests/test_billing_suspension.py::test_account_at_grace_boundary_stays_active
+E   AssertionError: assert True is False
+E     Boundary accounts should remain active until they are past the grace window.
+""",
+        issue_description="Billing automation should not suspend accounts that are merely at the grace boundary, and payment plans still pause suspension.",
+        bug_present=True,
+        bug_type="billing_suspension_contract_regression",
+        uncertainty_level="high",
+        files_before={
+            "src/billing_suspension.py": """def should_suspend_account(account: dict) -> bool:
+    if account["invoice_status"] != "unpaid":
+        return False
+    return account["overdue_days"] >= account["grace_days"]
+""",
+            "tests/test_billing_suspension.py": """from src.billing_suspension import should_suspend_account
+
+
+def test_account_at_grace_boundary_stays_active() -> None:
+    account = {
+        "invoice_status": "unpaid",
+        "overdue_days": 14,
+        "grace_days": 14,
+        "active_payment_plan": False,
+    }
+    assert should_suspend_account(account) is False
+""",
+            "docs/billing_suspension_contract.md": """Suspension contract:
+- suspend only when unpaid invoices are past the grace window
+- accounts exactly at the grace boundary remain active until the next day
+- active payment plans pause automated suspension
+""",
+        },
+        expected_bug_keywords=[
+            "boundary",
+            "grace",
+            "payment plan",
+            "suspend",
+            "unpaid",
+            "past",
+        ],
+        expected_fix_keywords=["grace", "payment plan", "active_payment_plan", "overdue", "strictly"],
+        clarification_hints={
+            "payment plan": "Active payment plans pause automated suspension, even when the invoice is overdue.",
+            "grace": "The account should suspend only after it is past the grace window, not when overdue_days equals grace_days.",
+            "default": "Billing suspension requires both conditions: past grace and no active payment plan.",
+        },
+        validator=_validate_suspension,
+    ),
 }
 
 
-def get_task(task_id: str) -> TaskSpec:
-    return TASKS[task_id]
+TASK_VARIANTS: Dict[str, List[TaskVariantSpec]] = {
+    "easy_keyword_preview": [
+        TaskVariantSpec(
+            variant_id="base",
+        ),
+        TaskVariantSpec(
+            variant_id="ticket-card-noise",
+            pr_title="Reduce ticket card preview allocations during keyword normalization",
+            commit_message="perf: trim preview formatting path and leave the search index untouched",
+            changed_files=[
+                "src/keyword_preview.py",
+                "src/search_index.py",
+                "tests/test_keyword_preview.py",
+            ],
+            code_diff_suffix="""diff --git a/src/search_index.py b/src/search_index.py
+index 18bb112..3c00491 100644
+--- a/src/search_index.py
++++ b/src/search_index.py
+@@ -8,3 +8,4 @@ def normalize_search_terms(values: list[str]) -> list[str]:
+     return [value.strip().lower() for value in values if value and value.strip()]
+
++# no behavior change in this helper
+""",
+            test_results_prefix="NOTE: Search indexing still behaves correctly; the regression is isolated to preview rendering.",
+            issue_description="Support ticket cards should still render a full normalized preview even after the allocation cleanup.",
+            clarification_hints={
+                "search": "The search index helper is unchanged. The regression is in the preview string returned to the card UI."
+            },
+        ),
+    ],
+    "medium_job_retry": [
+        TaskVariantSpec(
+            variant_id="base",
+        ),
+        TaskVariantSpec(
+            variant_id="queue-worker-noise",
+            pr_title="Clean up retry queue filtering and worker telemetry formatting",
+            commit_message="cleanup: simplify retry eligibility checks and reorder worker metrics output",
+            changed_files=[
+                "src/job_retry.py",
+                "src/worker_metrics.py",
+                "tests/test_job_retry.py",
+            ],
+            code_diff_suffix="""diff --git a/src/worker_metrics.py b/src/worker_metrics.py
+index 4dfac31..7a91c12 100644
+--- a/src/worker_metrics.py
++++ b/src/worker_metrics.py
+@@ -1,4 +1,4 @@
+ def render_worker_metrics(active_workers: int, queued_jobs: int) -> str:
+-    return f"workers={active_workers} queued={queued_jobs}"
++    return f"queued={queued_jobs} workers={active_workers}"
+""",
+            test_results_suffix="Hint: Only failed jobs with remaining retry attempts should be returned.",
+            issue_description="Retry selection should ignore telemetry refactors and only re-queue failed jobs that still have budget left.",
+        ),
+    ],
+    "hard_feature_flags": [
+        TaskVariantSpec(
+            variant_id="base",
+        ),
+        TaskVariantSpec(
+            variant_id="contract-doc-noise",
+            pr_title="Consolidate account PATCH flag merge and profile audit formatting",
+            commit_message="refactor: reuse account flag merge helper while touching nearby audit docs",
+            changed_files=[
+                "src/feature_flags.py",
+                "docs/account_patch_contract.md",
+                "docs/account_audit_log.md",
+                "tests/test_feature_flags.py",
+            ],
+            code_diff_suffix="""diff --git a/docs/account_audit_log.md b/docs/account_audit_log.md
+index 42aa551..cb18821 100644
+--- a/docs/account_audit_log.md
++++ b/docs/account_audit_log.md
+@@ -1,3 +1,3 @@
+ Audit log semantics:
+-record actor and account id
++record account id and actor
+ - do not modify flag state here
+""",
+            test_results_suffix="Hint: Treat False as an explicit value, not as a missing value.",
+            issue_description="The PATCH contract is tri-state: true enables, false disables, and null preserves the current flag.",
+        ),
+    ],
+    "hard_billing_suspension": [
+        TaskVariantSpec(
+            variant_id="base",
+        ),
+        TaskVariantSpec(
+            variant_id="collections-note-noise",
+            pr_title="Refactor collections suspension guard and adjacent dunning note formatting",
+            commit_message="cleanup: collapse suspension checks while touching dunning note templates",
+            changed_files=[
+                "src/billing_suspension.py",
+                "docs/billing_suspension_contract.md",
+                "templates/dunning_note.txt",
+                "tests/test_billing_suspension.py",
+            ],
+            code_diff_suffix="""diff --git a/templates/dunning_note.txt b/templates/dunning_note.txt
+index aa72c11..ea44cc2 100644
+--- a/templates/dunning_note.txt
++++ b/templates/dunning_note.txt
+@@ -1,2 +1,2 @@
+-Please update your billing details.
++Please review your billing details.
+ Payment plans remain visible in the customer portal.
+""",
+            test_results_suffix="Hint: Payment plans still pause suspension after the refactor.",
+            issue_description="Collections messaging changed nearby, but automated suspension still needs both the past-grace rule and the payment-plan exception.",
+        ),
+    ],
+    "frontier_discount_rollup": [
+        TaskVariantSpec(
+            variant_id="base",
+        ),
+        TaskVariantSpec(
+            variant_id="receipt-template-noise",
+            pr_title="Share flat coupon logic across checkout totals and receipt templates",
+            commit_message="refactor: align receipt rendering helper with checkout pricing rollup",
+            changed_files=[
+                "src/pricing_rollup.py",
+                "src/summary_builder.py",
+                "templates/receipt_header.txt",
+                "tests/test_pricing_rollup.py",
+                "docs/checkout_contract.md",
+            ],
+            code_diff_suffix="""diff --git a/templates/receipt_header.txt b/templates/receipt_header.txt
+index 12ab331..88cce19 100644
+--- a/templates/receipt_header.txt
++++ b/templates/receipt_header.txt
+@@ -1,2 +1,2 @@
+-thanks for shopping with us
++thanks for shopping with us online
+ keep this template cosmetic only
+""",
+            test_results_prefix="Observed only on oversized flat-coupon carts; standard percentage discounts still pass.",
+            issue_description="The receipt path should never show negative merchandise totals, even when shipping is present and the flat coupon exceeds subtotal.",
+        ),
+    ],
+}
+
+
+def get_task(task_id: str, variant_index: int = 0) -> TaskSpec:
+    base_task = TASKS[task_id]
+    variants = TASK_VARIANTS.get(task_id, [TaskVariantSpec(variant_id="base")])
+    variant = variants[variant_index % len(variants)]
+    return _materialize_variant(base_task, variant)
+
+
+def get_task_variant_count(task_id: str) -> int:
+    return len(TASK_VARIANTS.get(task_id, [TaskVariantSpec(variant_id="base")]))
 
 
 def list_tasks() -> List[TaskSpec]:

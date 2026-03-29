@@ -3,9 +3,17 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from grader import bug_identification_matches, evaluate_history, validate_fix_patch
-from models import Action, ActionType, EnvironmentState, HistoryEntry, Observation, Reward
-from tasks import TaskSpec, get_task, list_tasks
+from grader import bug_identification_matches, evaluate_history, fix_explanation_matches, validate_fix_patch
+from models import (
+    Action,
+    ActionType,
+    EnvironmentState,
+    HistoryEntry,
+    Observation,
+    PublicEnvironmentState,
+    Reward,
+)
+from tasks import TaskSpec, get_task, get_task_variant_count, list_tasks
 
 
 class CodeReviewEnv:
@@ -13,6 +21,7 @@ class CodeReviewEnv:
         self.max_steps = max_steps
         self._task_order = [task.task_id for task in list_tasks()]
         self._task_index = 0
+        self._task_variant_index = {task_id: 0 for task_id in self._task_order}
         self._task: Optional[TaskSpec] = None
         self._state = EnvironmentState(max_steps=max_steps)
 
@@ -20,10 +29,13 @@ class CodeReviewEnv:
         if task_id is None:
             task_id = self._task_order[self._task_index]
             self._task_index = (self._task_index + 1) % len(self._task_order)
-        self._task = get_task(task_id)
+        variant_index = self._task_variant_index.get(task_id, 0)
+        self._task = get_task(task_id, variant_index=variant_index)
+        self._task_variant_index[task_id] = (variant_index + 1) % get_task_variant_count(task_id)
         self._state = EnvironmentState(
             episode_id=str(uuid.uuid4()),
             task_id=self._task.task_id,
+            variant_id=self._task.variant_id,
             difficulty=self._task.difficulty,
             step_count=0,
             max_steps=self.max_steps,
@@ -42,6 +54,25 @@ class CodeReviewEnv:
 
     def state(self) -> EnvironmentState:
         return self._state.model_copy(deep=True)
+
+    def public_state(self) -> PublicEnvironmentState:
+        return PublicEnvironmentState(
+            episode_id=self._state.episode_id,
+            task_id=self._state.task_id,
+            variant_id=self._state.variant_id,
+            difficulty=self._state.difficulty,
+            step_count=self._state.step_count,
+            max_steps=self._state.max_steps,
+            clarification_requested=self._state.clarification_requested,
+            maintainer_replied=self._state.maintainer_replied,
+            history=self._state.history,
+            discussion_context=self._state.discussion_context,
+            action_log=self._state.action_log,
+            mistakes=self._state.mistakes,
+            reasoning_trace=self._state.reasoning_trace,
+            cumulative_reward=self._state.cumulative_reward,
+            done=self._state.done,
+        )
 
     def current_task(self) -> TaskSpec:
         if self._task is None:
@@ -83,14 +114,20 @@ class CodeReviewEnv:
 
         elif action.action_type == ActionType.SUGGEST_FIX:
             patch_valid, validation_message = validate_fix_patch(self._task, action.content)
+            has_diff = "diff --git" in action.content
             if patch_valid and not self._state.fix_suggested_correctly:
                 self._state.fix_suggested_correctly = True
                 reward_components["validated_fix"] = 0.3
                 reward_value += 0.3
                 reason_parts.append("suggested a fix that passes deterministic tests")
+            elif not patch_valid and not has_diff and fix_explanation_matches(self._task, action.content):
+                reward_components["partial_fix_reasoning"] = 0.1
+                reward_value += 0.1
+                reason_parts.append("described the right fix direction but did not provide an executable patch")
+                mistakes.append("incomplete fix suggestion")
             elif not patch_valid:
-                reward_components["invalid_fix"] = -0.2
-                reward_value -= 0.2
+                reward_components["invalid_fix"] = -0.1
+                reward_value -= 0.1
                 reason_parts.append(validation_message)
                 mistakes.append("invalid or incomplete fix suggestion")
 
@@ -212,7 +249,10 @@ class CodeReviewEnv:
         task = self.current_task()
         return Observation(
             task_id=task.task_id,
+            variant_id=task.variant_id,
             difficulty=task.difficulty,
+            uncertainty_level=task.uncertainty_level,
+            review_hint=task.review_hint,
             pr_title=task.pr_title,
             commit_message=task.commit_message,
             changed_files=task.changed_files,

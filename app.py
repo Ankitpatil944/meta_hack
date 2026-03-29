@@ -6,7 +6,16 @@ from fastapi import FastAPI, HTTPException
 
 from env import CodeReviewEnv
 from inference import choose_heuristic_action
-from models import Action, GraderRequest, GraderResponse, ResetRequest, ResetResponse, StepResponse, TaskSummary
+from models import (
+    Action,
+    GraderRequest,
+    GraderResponse,
+    PublicEnvironmentState,
+    ResetRequest,
+    ResetResponse,
+    StepResponse,
+    TaskSummary,
+)
 from tasks import get_task
 
 
@@ -36,9 +45,9 @@ def step(action: Action) -> StepResponse:
     return StepResponse(observation=observation, reward=reward, done=done, info=info)
 
 
-@app.get("/state")
-def state():
-    return ENV.state()
+@app.get("/state", response_model=PublicEnvironmentState)
+def state() -> PublicEnvironmentState:
+    return ENV.public_state()
 
 
 @app.get("/tasks", response_model=List[TaskSummary])

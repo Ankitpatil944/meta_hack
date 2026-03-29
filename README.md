@@ -4,6 +4,8 @@ This project implements a real-world OpenEnv-style environment for pull request 
 
 The environment is deterministic and designed for agent training and evaluation. It includes dense reward shaping, four curated tasks with increasing difficulty, a maintainer reply simulator for ambiguous reviews, action/mistake logging, and deterministic graders that validate proposed fixes by applying patches and running task-local tests.
 
+Each task is implemented as a task family with observable variants. On reset, the environment cycles through different PR metadata, diff noise, and failing-test context for the same underlying bug, which reduces answer-key memorization while preserving deterministic grading.
+
 ## Why this is novel
 
 - interactive PR review instead of one-shot classification
@@ -11,6 +13,7 @@ The environment is deterministic and designed for agent training and evaluation.
 - deterministic grading with task-local tests
 - clarification and maintainer replies for ambiguous reviews
 - frontier-style hard tasks with multi-file diffs and misleading edge-case failures
+- task-family variants that rotate visible PR context and distractor diffs at reset time
 
 ## Why this environment is useful
 
@@ -74,14 +77,14 @@ The `Action` model supports:
 
 ## Hidden environment state
 
-`state()` returns the typed internal state used to score the review:
+`state()` returns a typed public runtime state for the active episode:
 
 - episode metadata
-- hidden bug flags such as `bug_present` and `bug_type`
-- correctness trackers for diagnosis and fix quality
 - clarification and maintainer reply markers
 - action log, mistakes, and final reasoning trace for debugging/demo use
-- step counts, cumulative reward, and final decision
+- step counts and cumulative reward
+
+Hidden scoring fields such as bug truth and correctness trackers stay internal so agents cannot read oracle signals through the public API.
 
 ## Reward function
 
@@ -109,6 +112,10 @@ The PR inverts the retry guard for failed background jobs. The agent must infer 
 ### Hard: `hard_feature_flags`
 
 The PR changes partial feature-flag merges to use truthiness. The agent must reason about the difference between `None` and explicit `False`, and may ask for clarification before suggesting a patch and requesting changes.
+
+### Hard: `hard_billing_suspension`
+
+This task models billing automation. The visible failing test points at the grace-period boundary, so an obvious fix is to change `>=` back to `>`. That is necessary but not sufficient: the billing contract also says active payment plans pause suspension. The validator checks both conditions, so only a contract-correct fix passes.
 
 ### Frontier Hard: `frontier_discount_rollup`
 
@@ -174,10 +181,17 @@ Run the baseline:
 ```bash
 set OPENAI_API_KEY=your_key
 set MODEL_NAME=gpt-4.1-mini
+set ENV_BASE_URL=http://127.0.0.1:7860
 python inference.py
 ```
 
-If you want a local deterministic smoke test without a model key, hit `/baseline`. That route uses the bundled heuristic trajectory generator and returns per-task scores.
+If you are routing model calls through an OpenAI-compatible provider, also set:
+
+```bash
+set API_BASE_URL=https://your-model-endpoint/v1
+```
+
+If you want a local deterministic smoke test without a model key, hit `/baseline`. That route uses the bundled heuristic trajectory generator and returns per-task scores, but `inference.py` is the canonical submission baseline script.
 
 Run the demo walkthrough:
 
@@ -203,13 +217,16 @@ Create a Docker Space, tag it with `openenv`, and push this repository. The `Doc
 Environment variables for the external baseline runner:
 
 - `OPENAI_API_KEY`
-- `API_BASE_URL` when routing through a compatible OpenAI-style endpoint
+- `API_BASE_URL` for the OpenAI-compatible model endpoint
 - `MODEL_NAME`
 - `HF_TOKEN` if you want to reuse the same token in hosted runs
+- `ENV_BASE_URL` for the environment server URL when not using the default `http://127.0.0.1:7860`
 
 ## OpenEnv validation
 
-Install the framework:
+The Docker image installs `openenv-core`, so local and container validation use the same dependency set.
+
+Install the framework locally if needed:
 
 ```bash
 pip install openenv-core
@@ -233,6 +250,32 @@ The environment records:
 
 These are returned by `state()` and surfaced in `demo_run.py` for debugging and demos.
 
+## Why equivalent fixes are accepted
+
+The grader is behavior-based, not patch-string-based. Submitted unified diffs are applied to the task snapshot and then validated by task-specific checks. That means logically equivalent fixes are accepted as long as they restore the intended behavior.
+
+Examples:
+
+- `hard_feature_flags`: both `if value is not None:` and other equivalent tri-state-safe rewrites are accepted if explicit `False` updates work and `None` preserves the current value.
+- `medium_job_retry`: both “skip exhausted jobs” and “append only when attempts remain” styles are accepted if the resulting function returns only failed jobs with retry budget left.
+
+## Failure cases
+
+The grader also rejects plausible but incomplete or harmful actions.
+
+- `easy_keyword_preview`: returning the last cleaned token instead of joining all cleaned tokens is rejected as an invalid fix.
+- `easy_keyword_preview`: approving the PR immediately is penalized because the code is still buggy.
+- `hard_billing_suspension`: changing the boundary from `>=` to `>` without restoring the active payment plan exception is still rejected, even though it fixes the visible failing test.
+
 ## Baseline expectations
 
-The bundled heuristic baseline exposed by `/baseline` should achieve high deterministic scores across all four tasks because it uses task-specific review trajectories. The model-driven `inference.py` run is intended for reproducible benchmark scoring once `OPENAI_API_KEY` and `MODEL_NAME` are configured.
+The bundled heuristic baseline exposed by `/baseline` currently produces:
+
+- `easy_keyword_preview`: `1.0`
+- `medium_job_retry`: `1.0`
+- `hard_feature_flags`: `1.0`
+- `hard_billing_suspension`: `1.0`
+- `frontier_discount_rollup`: `1.0`
+- average score: `1.0`
+
+The official benchmark entrypoint is root-level `inference.py`, which uses the OpenAI client and the required submission env vars.
