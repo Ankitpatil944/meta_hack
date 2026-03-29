@@ -31,12 +31,18 @@ tasks:
   - id: frontier_discount_rollup
     difficulty: hard
     summary: Resolve an edge-case pricing regression where oversized flat coupons create negative merchandise totals across checkout and receipt rendering.
+  - id: frontier_incident_rollout
+    difficulty: hard
+    summary: Resolve both the threshold-boundary regression and lost customer-impacting override in mixed-signal incident paging changes.
   - id: hard_feature_flags
     difficulty: hard
     summary: Resolve explicit false versus None semantics in feature-flag merges.
   - id: hard_billing_suspension
     difficulty: hard
     summary: Resolve both the grace-period boundary and active-payment-plan exception in automated billing suspension.
+  - id: medium_receipt_format_cleanup
+    difficulty: medium
+    summary: Recognize a behavior-preserving receipt-format cleanup and correctly approve the PR.
   - id: medium_job_retry
     difficulty: medium
     summary: Detect that exhausted jobs are incorrectly re-queued for retries.

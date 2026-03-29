@@ -4,7 +4,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from env import CodeReviewEnv
-from grader import validate_fix_patch
+from grader import bug_identification_matches, validate_fix_patch
+from inference import choose_recovery_action, choose_safe_action, model_action_is_usable
 from models import Action, ActionType
 from tasks import get_task
 
@@ -81,6 +82,14 @@ def test_reset_cycles_task_variants() -> None:
     assert first.code_diff != second.code_diff
 
 
+def test_repeated_resets_randomize_visible_context() -> None:
+    env = CodeReviewEnv()
+    first = env.reset("easy_keyword_preview")
+    second = env.reset("easy_keyword_preview")
+    third = env.reset("easy_keyword_preview")
+    assert len({first.pr_title, second.pr_title, third.pr_title}) >= 2
+
+
 def test_incorrect_fix_penalized() -> None:
     env = CodeReviewEnv()
     env.reset("easy_keyword_preview")
@@ -134,6 +143,22 @@ def test_wrong_approval_penalty() -> None:
     assert done is True
     assert reward.value < 0
     assert reward.components["approved_buggy_pr"] < 0
+    assert info["final_decision"] == ActionType.APPROVE_PR.value
+
+
+def test_correct_approval_reward() -> None:
+    env = CodeReviewEnv()
+    env.reset("medium_receipt_format_cleanup")
+    _, reward, done, info = env.step(
+        Action(
+            action_type=ActionType.APPROVE_PR,
+            content="This refactor preserves receipt formatting behavior and the tests stay green.",
+        )
+    )
+    assert done is True
+    assert reward.value > 0
+    assert reward.components["correct_approval"] > 0
+    assert reward.components["fully_correct_review"] > 0
     assert info["final_decision"] == ActionType.APPROVE_PR.value
 
 
@@ -203,6 +228,31 @@ def test_hard_billing_suspension_requires_contract_complete_fix() -> None:
     assert valid is False
 
 
+def test_frontier_incident_rollout_requires_contract_complete_fix() -> None:
+    task = get_task("frontier_incident_rollout")
+    boundary_only_patch = """diff --git a/src/incident_rollout.py b/src/incident_rollout.py
+--- a/src/incident_rollout.py
++++ b/src/incident_rollout.py
+@@ -3,4 +3,4 @@
+     threshold = incident.get("page_threshold", 4)
+     if incident.get("customer_tier") == "vip":
+         return True
+-    return incident["severity"] >= threshold
++    return incident["severity"] > threshold
+"""
+    valid, _ = validate_fix_patch(task, boundary_only_patch)
+    assert valid is False
+
+
+def test_medium_retry_structured_diagnosis_accepts_semantic_explanation() -> None:
+    task = get_task("medium_job_retry")
+    explanation = (
+        "The retry selector is adding failed jobs after they have exhausted max_attempts. "
+        "It should only return failed jobs with remaining retry budget."
+    )
+    assert bug_identification_matches(task, explanation) is True
+
+
 def test_partial_fix_reasoning_gets_small_positive_signal() -> None:
     env = CodeReviewEnv()
     env.reset("medium_job_retry")
@@ -215,3 +265,138 @@ def test_partial_fix_reasoning_gets_small_positive_signal() -> None:
     assert done is False
     assert reward.components["partial_fix_reasoning"] > 0
     assert reward.value > 0
+
+
+def test_model_rejects_patch_on_step_zero() -> None:
+    env = CodeReviewEnv()
+    observation = env.reset("easy_keyword_preview").model_dump()
+    action = {
+        "action_type": "suggest_fix",
+        "content": "diff --git a/src/keyword_preview.py b/src/keyword_preview.py\n",
+    }
+    assert model_action_is_usable(action, observation, 0) is False
+
+
+def test_model_rejects_invalid_patch_on_fix_step() -> None:
+    env = CodeReviewEnv()
+    current_obs = env.reset("hard_feature_flags").model_dump()
+    action = {
+        "action_type": "suggest_fix",
+        "content": """diff --git a/src/feature_flags.py b/src/feature_flags.py
+--- a/src/feature_flags.py
++++ b/src/feature_flags.py
+@@ -1,8 +1,8 @@
+def merge_feature_flags(current: dict[str, bool], incoming: dict[str, Optional[bool]]) -> dict[str, bool]:
+     merged = current.copy()
+     for flag_name, value in incoming.items():
+-        if value:
+-            
+merged[flag_name] = value
++        if value is not None:
++            merged[flag_name] = value
+     return merged
+""",
+    }
+    assert model_action_is_usable(action, current_obs, 1) is False
+
+
+def test_step_zero_recovery_prefers_strong_incident_diagnosis() -> None:
+    env = CodeReviewEnv()
+    observation = env.reset("frontier_incident_rollout").model_dump()
+    action = choose_recovery_action(observation, 0)
+    assert action["action_type"] == "identify_bug"
+    lowered = action["content"].lower()
+    assert "customer-impacting" in lowered or "customer impacting" in lowered
+    assert "threshold" in lowered or "severity" in lowered
+
+
+def test_safe_action_recovers_from_invalid_model_patch_step() -> None:
+    env = CodeReviewEnv()
+    observation = env.reset("hard_feature_flags").model_dump()
+
+    class DummyClient:
+        pass
+
+    original_call_model = __import__("inference").call_model
+
+    def fake_call_model(client, obs, step_index, retry_hint=None):
+        return {
+            "action_type": "suggest_fix",
+            "content": """diff --git a/src/feature_flags.py b/src/feature_flags.py
+--- a/src/feature_flags.py
++++ b/src/feature_flags.py
+@@ -1,8 +1,8 @@
+def merge_feature_flags(current: dict[str, bool], incoming: dict[str, Optional[bool]]) -> dict[str, bool]:
+     merged = current.copy()
+     for flag_name, value in incoming.items():
+-        if value:
+-            
+merged[flag_name] = value
++        if value is not None:
++            merged[flag_name] = value
+     return merged
+""",
+        }
+
+    inference_module = __import__("inference")
+    inference_module.call_model = fake_call_model
+    try:
+        action = choose_safe_action(observation, 1, True, DummyClient())
+    finally:
+        inference_module.call_model = original_call_model
+
+    assert action["action_type"] == "suggest_fix"
+    assert "diff --git" in action["content"]
+
+
+def test_soft_mode_allows_partial_bug_diagnosis(monkeypatch) -> None:
+    monkeypatch.setenv("INFERENCE_STRICT_VALIDATION", "0")
+    env = CodeReviewEnv()
+    observation = env.reset("frontier_incident_rollout").model_dump()
+    action = {
+        "action_type": "identify_bug",
+        "content": (
+            'The change from incident["severity"] > threshold to incident["severity"] >= threshold '
+            "breaks the threshold boundary behavior."
+        ),
+    }
+    assert model_action_is_usable(action, observation, 0) is True
+
+
+def test_soft_mode_prefers_model_output_over_recovery(monkeypatch) -> None:
+    monkeypatch.setenv("INFERENCE_STRICT_VALIDATION", "0")
+    env = CodeReviewEnv()
+    observation = env.reset("hard_feature_flags").model_dump()
+
+    class DummyClient:
+        pass
+
+    original_call_model = __import__("inference").call_model
+
+    def fake_call_model(client, obs, step_index, retry_hint=None):
+        return {
+            "action_type": "suggest_fix",
+            "content": """diff --git a/src/feature_flags.py b/src/feature_flags.py
+--- a/src/feature_flags.py
++++ b/src/feature_flags.py
+@@ -1,8 +1,8 @@
+def merge_feature_flags(current: dict[str, bool], incoming: dict[str, Optional[bool]]) -> dict[str, bool]:
+     merged = current.copy()
+     for flag_name, value in incoming.items():
+-        if value:
+-            
+merged[flag_name] = value
++        if value is not None:
++            merged[flag_name] = value
+     return merged
+""",
+        }
+
+    inference_module = __import__("inference")
+    inference_module.call_model = fake_call_model
+    try:
+        action = choose_safe_action(observation, 1, True, DummyClient())
+    finally:
+        inference_module.call_model = original_call_model
+
+    assert "merged[flag_name] = value" in action["content"]

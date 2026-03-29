@@ -29,6 +29,7 @@ class TaskSpec:
     files_before: Dict[str, str]
     expected_bug_keywords: List[str]
     expected_fix_keywords: List[str]
+    diagnosis_concepts: List[List[str]] = field(default_factory=list)
     variant_id: str = "base"
     clarification_hints: Dict[str, str] = field(default_factory=dict)
     validator: Optional[Validator] = None
@@ -48,33 +49,71 @@ class TaskVariantSpec:
     test_results_suffix: str = ""
     issue_description: Optional[str] = None
     clarification_hints: Optional[Dict[str, str]] = None
+    randomization_tokens: Dict[str, List[str]] = field(default_factory=dict)
 
 
-def _materialize_variant(base: TaskSpec, variant: TaskVariantSpec) -> TaskSpec:
+def _replace_tokens(value: str, randomization_tokens: Dict[str, List[str]], seed_index: int) -> str:
+    output = value
+    for token, options in randomization_tokens.items():
+        if not options:
+            continue
+        replacement = options[seed_index % len(options)]
+        output = output.replace(f"{{{token}}}", replacement)
+    return output
+
+
+def _materialize_variant(base: TaskSpec, variant: TaskVariantSpec, seed_index: int = 0) -> TaskSpec:
     changed_files = list(base.changed_files)
     if variant.changed_files is not None:
         changed_files = variant.changed_files
 
+    randomization_tokens = variant.randomization_tokens
+    if randomization_tokens:
+        changed_files = [_replace_tokens(path, randomization_tokens, seed_index) for path in changed_files]
+
     clarification_hints = dict(base.clarification_hints)
     if variant.clarification_hints:
         clarification_hints.update(variant.clarification_hints)
+    if randomization_tokens:
+        clarification_hints = {
+            _replace_tokens(key, randomization_tokens, seed_index): _replace_tokens(value, randomization_tokens, seed_index)
+            for key, value in clarification_hints.items()
+        }
 
     code_diff_parts = [part for part in [variant.code_diff_prefix, base.code_diff, variant.code_diff_suffix] if part]
     test_result_parts = [
         part for part in [variant.test_results_prefix, base.test_results, variant.test_results_suffix] if part
     ]
 
+    code_diff = "\n\n".join(code_diff_parts)
+    test_results = "\n".join(test_result_parts)
+    pr_title = variant.pr_title or base.pr_title
+    summary = variant.summary or base.summary
+    review_hint = variant.review_hint or base.review_hint
+    commit_message = variant.commit_message or base.commit_message
+    issue_description = variant.issue_description if variant.issue_description is not None else base.issue_description
+
+    if randomization_tokens:
+        pr_title = _replace_tokens(pr_title, randomization_tokens, seed_index)
+        summary = _replace_tokens(summary, randomization_tokens, seed_index)
+        review_hint = _replace_tokens(review_hint, randomization_tokens, seed_index)
+        commit_message = _replace_tokens(commit_message, randomization_tokens, seed_index)
+        code_diff = _replace_tokens(code_diff, randomization_tokens, seed_index)
+        test_results = _replace_tokens(test_results, randomization_tokens, seed_index)
+        if issue_description is not None:
+            issue_description = _replace_tokens(issue_description, randomization_tokens, seed_index)
+
     return replace(
         base,
         variant_id=variant.variant_id,
-        pr_title=variant.pr_title or base.pr_title,
-        summary=variant.summary or base.summary,
-        review_hint=variant.review_hint or base.review_hint,
-        commit_message=variant.commit_message or base.commit_message,
+        pr_title=pr_title,
+        summary=summary,
+        review_hint=review_hint,
+        commit_message=commit_message,
         changed_files=changed_files,
-        code_diff="\n\n".join(code_diff_parts),
-        test_results="\n".join(test_result_parts),
-        issue_description=variant.issue_description if variant.issue_description is not None else base.issue_description,
+        code_diff=code_diff,
+        test_results=test_results,
+        issue_description=issue_description,
         clarification_hints=clarification_hints,
     )
 
@@ -212,6 +251,58 @@ def _validate_suspension(workspace: Path) -> Tuple[bool, str]:
     return True, "All billing suspension tests passed."
 
 
+def _validate_approval(workspace: Path) -> Tuple[bool, str]:
+    module = _load_module("task_medium_receipt_format", workspace / "src" / "receipt_format.py")
+    build_receipt_line = getattr(module, "build_receipt_line")
+
+    line = build_receipt_line("starter", 2500, 2)
+    if line != "starter x2 - $50.00":
+        return False, "Receipt formatting should stay unchanged for standard line items."
+
+    discounted = build_receipt_line("pro", 1250, 1)
+    if discounted != "pro x1 - $12.50":
+        return False, "Receipt formatting should preserve quantity and currency formatting."
+
+    return True, "All receipt formatting tests passed."
+
+
+def _validate_incident_rollout(workspace: Path) -> Tuple[bool, str]:
+    module = _load_module("task_frontier_incident_rollout", workspace / "src" / "incident_rollout.py")
+    should_page_incident = getattr(module, "should_page_incident")
+
+    boundary_incident = {
+        "severity": 4,
+        "page_threshold": 4,
+        "minutes_open": 5,
+        "customer_tier": "standard",
+        "customer_impacting": False,
+    }
+    if should_page_incident(boundary_incident) is not False:
+        return False, "Severity equal to the threshold should not page without customer impact."
+
+    impacting_incident = {
+        "severity": 2,
+        "page_threshold": 4,
+        "minutes_open": 10,
+        "customer_tier": "standard",
+        "customer_impacting": True,
+    }
+    if should_page_incident(impacting_incident) is not True:
+        return False, "Customer-impacting incidents must still page even below the severity threshold."
+
+    severe_incident = {
+        "severity": 5,
+        "page_threshold": 4,
+        "minutes_open": 3,
+        "customer_tier": "standard",
+        "customer_impacting": False,
+    }
+    if should_page_incident(severe_incident) is not True:
+        return False, "Incidents above the page threshold should page."
+
+    return True, "All incident rollout tests passed."
+
+
 TASKS: Dict[str, TaskSpec] = {
     "easy_keyword_preview": TaskSpec(
         task_id="easy_keyword_preview",
@@ -274,6 +365,7 @@ def test_preview_skips_empty_values() -> None:
         },
         expected_bug_keywords=["first", "only", "keyword", "preview", "all", "join"],
         expected_fix_keywords=["join", "cleaned", "comma", "preview"],
+        diagnosis_concepts=[["first", "only"], ["preview", "keyword"], ["join", "all", "cleaned"]],
         clarification_hints={
             "preview": "The card should display the entire normalized preview string, not just the first token.",
             "default": "This ticket card preview is meant to summarize all searchable terms.",
@@ -349,6 +441,11 @@ def test_retry_selector_only_returns_failed_jobs_with_budget() -> None:
         },
         expected_bug_keywords=["retry", "attempt", "max_attempts", "inverted", "exhausted", "failed"],
         expected_fix_keywords=["continue", "less than", "retry budget", "skip exhausted"],
+        diagnosis_concepts=[
+            ["retry", "attempt", "max_attempts"],
+            ["failed", "retryable", "re-queued", "returned"],
+            ["remaining", "less than", "budget", "exhausted", "skip"],
+        ],
         clarification_hints={
             "budget": "A job should be retried only while attempts remain strictly below max_attempts.",
             "default": "The queue should exclude jobs that have already consumed their retry budget.",
@@ -429,6 +526,11 @@ true = explicitly enable the flag
         },
         expected_bug_keywords=["false", "none", "truthy", "flag", "explicit", "disable"],
         expected_fix_keywords=["is none", "continue", "explicit false", "merged"],
+        diagnosis_concepts=[
+            ["false", "none", "null"],
+            ["truthy", "ignore", "explicit"],
+            ["disable", "preserve", "current", "flag"],
+        ],
         clarification_hints={
             "false": "For this endpoint, null means no change. Explicit false must disable the flag.",
             "none": "For this endpoint, null means no change. Explicit false must disable the flag.",
@@ -540,6 +642,11 @@ def test_flat_coupon_is_capped_before_shipping() -> None:
         },
         expected_bug_keywords=["flat", "coupon", "cap", "subtotal", "negative", "receipt", "shipping"],
         expected_fix_keywords=["min", "subtotal", "cap", "discount", "shipping"],
+        diagnosis_concepts=[
+            ["flat", "coupon", "discount"],
+            ["subtotal", "cap", "capped"],
+            ["negative", "receipt", "shipping", "total"],
+        ],
         clarification_hints={
             "coupon": "Flat coupons are capped at the merchandise subtotal. Shipping is applied after discounts.",
             "shipping": "Shipping is added after discounts, so an oversized coupon should zero out merchandise but not create a negative total.",
@@ -624,12 +731,171 @@ def test_account_at_grace_boundary_stays_active() -> None:
             "past",
         ],
         expected_fix_keywords=["grace", "payment plan", "active_payment_plan", "overdue", "strictly"],
+        diagnosis_concepts=[
+            ["grace", "boundary", "past"],
+            ["payment plan", "active_payment_plan"],
+            ["suspend", "overdue", "unpaid"],
+        ],
         clarification_hints={
             "payment plan": "Active payment plans pause automated suspension, even when the invoice is overdue.",
             "grace": "The account should suspend only after it is past the grace window, not when overdue_days equals grace_days.",
             "default": "Billing suspension requires both conditions: past grace and no active payment plan.",
         },
         validator=_validate_suspension,
+    ),
+    "medium_receipt_format_cleanup": TaskSpec(
+        task_id="medium_receipt_format_cleanup",
+        difficulty="medium",
+        pr_title="Refactor receipt line formatting helper for readability",
+        summary=(
+            "Reviewer must recognize that the PR is safe. The diff is a formatting cleanup with no behavior change, "
+            "and the correct trajectory is to approve the PR rather than invent a bug."
+        ),
+        review_hint="Important: this PR should preserve existing receipt formatting behavior; do not reject harmless cleanups.",
+        commit_message="refactor: simplify receipt line formatting without changing output",
+        changed_files=["src/receipt_format.py", "tests/test_receipt_format.py"],
+        code_diff="""diff --git a/src/receipt_format.py b/src/receipt_format.py
+index 441aa32..553bc71 100644
+--- a/src/receipt_format.py
++++ b/src/receipt_format.py
+@@ -1,3 +1,4 @@
+ def build_receipt_line(name: str, price_cents: int, quantity: int) -> str:
+     total_cents = price_cents * quantity
+-    return f"{name} x{quantity} - ${total_cents / 100:.2f}"
++    total_dollars = total_cents / 100
++    return f"{name} x{quantity} - ${total_dollars:.2f}"
+""",
+        test_results="""PASSED tests/test_receipt_format.py::test_receipt_line_uses_quantity_and_currency_formatting
+PASSED tests/test_receipt_format.py::test_receipt_line_handles_single_quantity
+""",
+        issue_description="The refactor should not change receipt formatting behavior.",
+        bug_present=False,
+        bug_type="no_regression",
+        uncertainty_level="low",
+        files_before={
+            "src/receipt_format.py": """def build_receipt_line(name: str, price_cents: int, quantity: int) -> str:
+    total_cents = price_cents * quantity
+    total_dollars = total_cents / 100
+    return f"{name} x{quantity} - ${total_dollars:.2f}"
+""",
+            "tests/test_receipt_format.py": """from src.receipt_format import build_receipt_line
+
+
+def test_receipt_line_uses_quantity_and_currency_formatting() -> None:
+    assert build_receipt_line("starter", 2500, 2) == "starter x2 - $50.00"
+
+
+def test_receipt_line_handles_single_quantity() -> None:
+    assert build_receipt_line("pro", 1250, 1) == "pro x1 - $12.50"
+""",
+        },
+        expected_bug_keywords=["regression", "bug", "format", "wrong", "broken", "currency"],
+        expected_fix_keywords=["preserve", "format", "currency", "quantity"],
+        diagnosis_concepts=[],
+        clarification_hints={
+            "default": "This refactor should preserve the exact same receipt output. There is no known regression here.",
+        },
+        validator=_validate_approval,
+    ),
+    "frontier_incident_rollout": TaskSpec(
+        task_id="frontier_incident_rollout",
+        difficulty="hard",
+        pr_title="Unify incident paging thresholds with rollout-safe defaults",
+        summary=(
+            "Reviewer must catch a mixed-signal incident-management regression. The visible failing test points to the threshold boundary, "
+            "but the rollout also drops the customer-impacting override. A boundary-only fix is still wrong."
+        ),
+        review_hint="Important: incidents should page only above the threshold unless they are customer-impacting, which pages regardless.",
+        commit_message="refactor: collapse incident paging logic and tidy nearby rollout notes",
+        changed_files=[
+            "src/incident_rollout.py",
+            "src/rollout_notes.py",
+            "docs/incident_paging_contract.md",
+            "tests/test_incident_rollout.py",
+        ],
+        code_diff="""diff --git a/src/incident_rollout.py b/src/incident_rollout.py
+index 55ad221..8bc9911 100644
+--- a/src/incident_rollout.py
++++ b/src/incident_rollout.py
+@@ -1,7 +1,7 @@
+ def should_page_incident(incident: dict) -> bool:
+     threshold = incident.get("page_threshold", 4)
+-    if incident.get("customer_impacting", False):
+-        return True
+-    return incident["severity"] > threshold
++    if incident.get("customer_tier") == "vip":
++        return True
++    return incident["severity"] >= threshold
+
+diff --git a/src/rollout_notes.py b/src/rollout_notes.py
+index 88ba110..88ba223 100644
+--- a/src/rollout_notes.py
++++ b/src/rollout_notes.py
+@@ -1,3 +1,3 @@
+ def render_rollout_note(flag_name: str) -> str:
+-    return f"rollout-note:{flag_name}"
++    return f"rollout:{flag_name}"
+
+diff --git a/docs/incident_paging_contract.md b/docs/incident_paging_contract.md
+index 0daaa10..0daaa10 100644
+--- a/docs/incident_paging_contract.md
++++ b/docs/incident_paging_contract.md
+@@ -1,4 +1,4 @@
+ Paging contract:
+ - page when severity is strictly above the configured threshold
+ - customer-impacting incidents always page immediately
+ - cosmetic rollout note changes must not affect paging behavior
+""",
+        test_results="""FAILED tests/test_incident_rollout.py::test_threshold_boundary_does_not_page
+E   AssertionError: assert True is False
+E     Incidents exactly at the threshold should remain non-paging until severity is above the threshold.
+""",
+        issue_description="Rollout-safe paging should still preserve the customer-impacting override and the strict-above-threshold rule.",
+        bug_present=True,
+        bug_type="incident_paging_contract_regression",
+        uncertainty_level="high",
+        files_before={
+            "src/incident_rollout.py": """def should_page_incident(incident: dict) -> bool:
+    threshold = incident.get("page_threshold", 4)
+    if incident.get("customer_tier") == "vip":
+        return True
+    return incident["severity"] >= threshold
+""",
+            "src/rollout_notes.py": """def render_rollout_note(flag_name: str) -> str:
+    return f"rollout:{flag_name}"
+""",
+            "docs/incident_paging_contract.md": """Paging contract:
+- page when severity is strictly above the configured threshold
+- customer-impacting incidents always page immediately
+- cosmetic rollout note changes must not affect paging behavior
+""",
+            "tests/test_incident_rollout.py": """from src.incident_rollout import should_page_incident
+
+
+def test_threshold_boundary_does_not_page() -> None:
+    incident = {
+        "severity": 4,
+        "page_threshold": 4,
+        "minutes_open": 5,
+        "customer_tier": "standard",
+        "customer_impacting": False,
+    }
+    assert should_page_incident(incident) is False
+""",
+        },
+        expected_bug_keywords=["threshold", "customer-impacting", "page", "severity", "strictly above", "override"],
+        expected_fix_keywords=["customer-impacting", "threshold", ">", "override", "page"],
+        diagnosis_concepts=[
+            ["threshold", "strictly above", "boundary", "severity"],
+            ["customer-impacting", "impacting", "override"],
+            ["page", "paging", "incident"],
+        ],
+        clarification_hints={
+            "customer": "Customer-impacting incidents must still page immediately, regardless of the severity threshold.",
+            "threshold": "The threshold is strict: incidents at the threshold should not page unless another override applies.",
+            "default": "The rollout keeps two rules: strict-above-threshold paging and customer-impacting override paging.",
+        },
+        validator=_validate_incident_rollout,
     ),
 }
 
@@ -638,11 +904,12 @@ TASK_VARIANTS: Dict[str, List[TaskVariantSpec]] = {
     "easy_keyword_preview": [
         TaskVariantSpec(
             variant_id="base",
+            randomization_tokens={"ticket_surface": ["ticket card", "queue card", "support card"]},
         ),
         TaskVariantSpec(
             variant_id="ticket-card-noise",
-            pr_title="Reduce ticket card preview allocations during keyword normalization",
-            commit_message="perf: trim preview formatting path and leave the search index untouched",
+            pr_title="Reduce {ticket_surface} preview allocations during keyword normalization",
+            commit_message="perf: trim {ticket_surface} preview formatting path and leave the search index untouched",
             changed_files=[
                 "src/keyword_preview.py",
                 "src/search_index.py",
@@ -657,21 +924,23 @@ index 18bb112..3c00491 100644
 
 +# no behavior change in this helper
 """,
-            test_results_prefix="NOTE: Search indexing still behaves correctly; the regression is isolated to preview rendering.",
-            issue_description="Support ticket cards should still render a full normalized preview even after the allocation cleanup.",
+            test_results_prefix="NOTE: Search indexing still behaves correctly; the regression is isolated to {ticket_surface} preview rendering.",
+            issue_description="Support {ticket_surface}s should still render a full normalized preview even after the allocation cleanup.",
             clarification_hints={
-                "search": "The search index helper is unchanged. The regression is in the preview string returned to the card UI."
+                "search": "The search index helper is unchanged. The regression is in the preview string returned to the {ticket_surface} UI."
             },
+            randomization_tokens={"ticket_surface": ["ticket card", "queue card", "support card"]},
         ),
     ],
     "medium_job_retry": [
         TaskVariantSpec(
             variant_id="base",
+            randomization_tokens={"queue_surface": ["retry queue", "worker queue", "job queue"]},
         ),
         TaskVariantSpec(
             variant_id="queue-worker-noise",
-            pr_title="Clean up retry queue filtering and worker telemetry formatting",
-            commit_message="cleanup: simplify retry eligibility checks and reorder worker metrics output",
+            pr_title="Clean up {queue_surface} filtering and worker telemetry formatting",
+            commit_message="cleanup: simplify {queue_surface} eligibility checks and reorder worker metrics output",
             changed_files=[
                 "src/job_retry.py",
                 "src/worker_metrics.py",
@@ -687,17 +956,19 @@ index 4dfac31..7a91c12 100644
 +    return f"queued={queued_jobs} workers={active_workers}"
 """,
             test_results_suffix="Hint: Only failed jobs with remaining retry attempts should be returned.",
-            issue_description="Retry selection should ignore telemetry refactors and only re-queue failed jobs that still have budget left.",
+            issue_description="Retry selection should ignore telemetry refactors and only re-queue failed jobs that still have budget left in the {queue_surface}.",
+            randomization_tokens={"queue_surface": ["retry queue", "worker queue", "job queue"]},
         ),
     ],
     "hard_feature_flags": [
         TaskVariantSpec(
             variant_id="base",
+            randomization_tokens={"account_surface": ["account PATCH", "profile PATCH", "tenant PATCH"]},
         ),
         TaskVariantSpec(
             variant_id="contract-doc-noise",
-            pr_title="Consolidate account PATCH flag merge and profile audit formatting",
-            commit_message="refactor: reuse account flag merge helper while touching nearby audit docs",
+            pr_title="Consolidate {account_surface} flag merge and profile audit formatting",
+            commit_message="refactor: reuse {account_surface} flag merge helper while touching nearby audit docs",
             changed_files=[
                 "src/feature_flags.py",
                 "docs/account_patch_contract.md",
@@ -715,17 +986,19 @@ index 42aa551..cb18821 100644
  - do not modify flag state here
 """,
             test_results_suffix="Hint: Treat False as an explicit value, not as a missing value.",
-            issue_description="The PATCH contract is tri-state: true enables, false disables, and null preserves the current flag.",
+            issue_description="The {account_surface} contract is tri-state: true enables, false disables, and null preserves the current flag.",
+            randomization_tokens={"account_surface": ["account PATCH", "profile PATCH", "tenant PATCH"]},
         ),
     ],
     "hard_billing_suspension": [
         TaskVariantSpec(
             variant_id="base",
+            randomization_tokens={"collection_surface": ["collections", "billing controls", "dunning"]},
         ),
         TaskVariantSpec(
             variant_id="collections-note-noise",
-            pr_title="Refactor collections suspension guard and adjacent dunning note formatting",
-            commit_message="cleanup: collapse suspension checks while touching dunning note templates",
+            pr_title="Refactor {collection_surface} suspension guard and adjacent dunning note formatting",
+            commit_message="cleanup: collapse suspension checks while touching {collection_surface} note templates",
             changed_files=[
                 "src/billing_suspension.py",
                 "docs/billing_suspension_contract.md",
@@ -742,17 +1015,63 @@ index aa72c11..ea44cc2 100644
  Payment plans remain visible in the customer portal.
 """,
             test_results_suffix="Hint: Payment plans still pause suspension after the refactor.",
-            issue_description="Collections messaging changed nearby, but automated suspension still needs both the past-grace rule and the payment-plan exception.",
+            issue_description="{collection_surface} messaging changed nearby, but automated suspension still needs both the past-grace rule and the payment-plan exception.",
+            randomization_tokens={"collection_surface": ["collections", "billing controls", "dunning"]},
+        ),
+    ],
+    "medium_receipt_format_cleanup": [
+        TaskVariantSpec(
+            variant_id="base",
+            randomization_tokens={"receipt_surface": ["receipt", "checkout receipt", "invoice receipt"]},
+        ),
+        TaskVariantSpec(
+            variant_id="cosmetic-template-noise",
+            pr_title="Tidy {receipt_surface} formatting helper and adjacent template spacing",
+            commit_message="cleanup: reduce inline arithmetic and normalize {receipt_surface} template spacing",
+            changed_files=[
+                "src/receipt_format.py",
+                "templates/receipt_footer.txt",
+                "tests/test_receipt_format.py",
+            ],
+            code_diff_suffix="""diff --git a/templates/receipt_footer.txt b/templates/receipt_footer.txt
+index 27aa110..62bc991 100644
+--- a/templates/receipt_footer.txt
++++ b/templates/receipt_footer.txt
+@@ -1,2 +1,2 @@
+-thanks for your order
++thanks for your order
+ visit again soon
+""",
+            issue_description="The formatting cleanup should remain behavior-preserving across {receipt_surface} output.",
+            randomization_tokens={"receipt_surface": ["receipt", "checkout receipt", "invoice receipt"]},
+        ),
+    ],
+    "frontier_incident_rollout": [
+        TaskVariantSpec(
+            variant_id="base",
+            randomization_tokens={"incident_surface": ["incident", "incident page", "on-call page"]},
+        ),
+        TaskVariantSpec(
+            variant_id="rollout-note-noise",
+            pr_title="Unify {incident_surface} thresholds and tidy rollout annotations",
+            commit_message="refactor: collapse {incident_surface} paging checks while touching rollout note formatting",
+            test_results_suffix="Hint: customer-impacting incidents still page immediately even if a nearby rollout note changed.",
+            issue_description="The {incident_surface} rollout should preserve both the strict threshold rule and the customer-impacting override.",
+            clarification_hints={
+                "rollout": "The rollout note formatting change is cosmetic. The real logic still depends on threshold and customer impact."
+            },
+            randomization_tokens={"incident_surface": ["incident", "incident page", "on-call page"]},
         ),
     ],
     "frontier_discount_rollup": [
         TaskVariantSpec(
             variant_id="base",
+            randomization_tokens={"receipt_surface": ["receipt", "checkout summary", "order summary"]},
         ),
         TaskVariantSpec(
             variant_id="receipt-template-noise",
-            pr_title="Share flat coupon logic across checkout totals and receipt templates",
-            commit_message="refactor: align receipt rendering helper with checkout pricing rollup",
+            pr_title="Share flat coupon logic across checkout totals and {receipt_surface} templates",
+            commit_message="refactor: align {receipt_surface} rendering helper with checkout pricing rollup",
             changed_files=[
                 "src/pricing_rollup.py",
                 "src/summary_builder.py",
@@ -770,7 +1089,8 @@ index 12ab331..88cce19 100644
  keep this template cosmetic only
 """,
             test_results_prefix="Observed only on oversized flat-coupon carts; standard percentage discounts still pass.",
-            issue_description="The receipt path should never show negative merchandise totals, even when shipping is present and the flat coupon exceeds subtotal.",
+            issue_description="The {receipt_surface} path should never show negative merchandise totals, even when shipping is present and the flat coupon exceeds subtotal.",
+            randomization_tokens={"receipt_surface": ["receipt", "checkout summary", "order summary"]},
         ),
     ],
 }
@@ -780,7 +1100,7 @@ def get_task(task_id: str, variant_index: int = 0) -> TaskSpec:
     base_task = TASKS[task_id]
     variants = TASK_VARIANTS.get(task_id, [TaskVariantSpec(variant_id="base")])
     variant = variants[variant_index % len(variants)]
-    return _materialize_variant(base_task, variant)
+    return _materialize_variant(base_task, variant, seed_index=variant_index // len(variants))
 
 
 def get_task_variant_count(task_id: str) -> int:

@@ -2,9 +2,9 @@
 
 This project implements a real-world OpenEnv-style environment for pull request review. An agent reads realistic PR metadata, failing tests, and a code diff, then takes review actions over a trajectory: identify the bug, suggest a patch, comment on the PR, ask for clarification, and decide whether to approve or request changes.
 
-The environment is deterministic and designed for agent training and evaluation. It includes dense reward shaping, four curated tasks with increasing difficulty, a maintainer reply simulator for ambiguous reviews, action/mistake logging, and deterministic graders that validate proposed fixes by applying patches and running task-local tests.
+The environment is deterministic and designed for agent training and evaluation. It includes dense reward shaping, seven curated tasks spanning easy, medium, and hard review episodes, a maintainer reply simulator for ambiguous reviews, action/mistake logging, and deterministic graders that validate proposed fixes against task-local contract checks.
 
-Each task is implemented as a task family with observable variants. On reset, the environment cycles through different PR metadata, diff noise, and failing-test context for the same underlying bug, which reduces answer-key memorization while preserving deterministic grading.
+Each task is implemented as a task family with observable variants. On reset, the environment cycles through different PR metadata, diff noise, and failing-test context for the same underlying bug, and several families also rotate visible labels such as UI surface names or rollout terminology. This reduces answer-key memorization while preserving deterministic grading.
 
 ## Why this is novel
 
@@ -30,16 +30,16 @@ Most code review benchmarks are single-turn classification tasks. This environme
 
 ```text
 .
-├── app.py
-├── env.py
-├── grader.py
-├── inference.py
-├── models.py
-├── openenv.yaml
-├── README.md
-├── requirements.txt
-├── tasks.py
-└── Dockerfile
+|-- app.py
+|-- env.py
+|-- grader.py
+|-- inference.py
+|-- models.py
+|-- openenv.yaml
+|-- README.md
+|-- requirements.txt
+|-- tasks.py
+`-- Dockerfile
 ```
 
 ## Observation space
@@ -109,6 +109,10 @@ The PR regresses a ticket keyword preview builder so it returns only the first c
 
 The PR inverts the retry guard for failed background jobs. The agent must infer from the failing test that the queue now selects exhausted jobs while skipping jobs with remaining retry budget.
 
+### Medium: `medium_receipt_format_cleanup`
+
+This task is intentionally safe. The PR simplifies receipt line formatting without changing behavior, and the tests remain green. A good reviewer should approve the PR rather than hallucinate a regression. This breaks the benchmark pattern where every task requires rejection.
+
 ### Hard: `hard_feature_flags`
 
 The PR changes partial feature-flag merges to use truthiness. The agent must reason about the difference between `None` and explicit `False`, and may ask for clarification before suggesting a patch and requesting changes.
@@ -117,9 +121,32 @@ The PR changes partial feature-flag merges to use truthiness. The agent must rea
 
 This task models billing automation. The visible failing test points at the grace-period boundary, so an obvious fix is to change `>=` back to `>`. That is necessary but not sufficient: the billing contract also says active payment plans pause suspension. The validator checks both conditions, so only a contract-correct fix passes.
 
+### Frontier Hard: `frontier_incident_rollout`
+
+This task is intentionally mixed-signal. The PR touches incident paging logic and a nearby rollout-note helper. The visible failing test points to the severity-threshold boundary, but the rollout also drops the customer-impacting override and replaces it with an irrelevant VIP shortcut. A threshold-only fix is still wrong, so the reviewer has to separate the cosmetic diff from the real contract regression.
+
 ### Frontier Hard: `frontier_discount_rollup`
 
 This task spans checkout calculation and receipt rendering. Most carts look fine, but an oversized flat coupon creates a negative merchandise total on an edge case with shipping. The agent must combine multi-file diff context, a contract doc, and misleadingly narrow test evidence to propose the right capped-discount fix.
+
+## Baseline scores
+
+Deterministic local baseline (`GET /baseline`, heuristic trajectory generator):
+
+- `easy_keyword_preview`: `1.0`
+- `medium_job_retry`: `1.0`
+- `medium_receipt_format_cleanup`: `1.0`
+- `hard_feature_flags`: `1.0`
+- `hard_billing_suspension`: `1.0`
+- `frontier_incident_rollout`: `1.0`
+- `frontier_discount_rollup`: `1.0`
+- Average: `1.0`
+
+Canonical submission runner:
+
+- `inference.py` is the required root-level submission script.
+- It uses the OpenAI client and reads `OPENAI_API_KEY` or `HF_TOKEN`, plus `API_BASE_URL`, `MODEL_NAME`, and optional `ENV_BASE_URL`.
+- The deterministic `/baseline` route is for local smoke testing; `inference.py` is for external reproduction.
 
 ## API
 
@@ -258,6 +285,7 @@ Examples:
 
 - `hard_feature_flags`: both `if value is not None:` and other equivalent tri-state-safe rewrites are accepted if explicit `False` updates work and `None` preserves the current value.
 - `medium_job_retry`: both “skip exhausted jobs” and “append only when attempts remain” styles are accepted if the resulting function returns only failed jobs with retry budget left.
+- `frontier_incident_rollout`: fixes are accepted only if they restore both the strict-above-threshold rule and the customer-impacting override, even if the visible failing test only highlights the threshold boundary.
 
 ## Failure cases
 
@@ -266,6 +294,15 @@ The grader also rejects plausible but incomplete or harmful actions.
 - `easy_keyword_preview`: returning the last cleaned token instead of joining all cleaned tokens is rejected as an invalid fix.
 - `easy_keyword_preview`: approving the PR immediately is penalized because the code is still buggy.
 - `hard_billing_suspension`: changing the boundary from `>=` to `>` without restoring the active payment plan exception is still rejected, even though it fixes the visible failing test.
+- `frontier_incident_rollout`: changing only the threshold boundary is still rejected because customer-impacting incidents must also retain their immediate paging override.
+- `medium_receipt_format_cleanup`: inventing a bug and requesting changes is the wrong decision; the correct behavior is to approve the safe refactor.
+
+## Limitations
+
+- The tasks are still compact PR snapshots rather than large repository-scale reviews.
+- Task families rotate visible context, distractor diffs, and several surface labels, but they are not yet fully randomized at the identifier and literal level.
+- The baseline agent includes fallback and recovery logic for robustness; it is a strong reference policy, not a claim that an unconstrained frontier model will solve every task without scaffolding.
+- Diagnosis scoring still uses task-specific keyword cues before fix validation, even though final fix acceptance is behavior-based.
 
 ## Baseline expectations
 
@@ -273,8 +310,10 @@ The bundled heuristic baseline exposed by `/baseline` currently produces:
 
 - `easy_keyword_preview`: `1.0`
 - `medium_job_retry`: `1.0`
+- `medium_receipt_format_cleanup`: `1.0`
 - `hard_feature_flags`: `1.0`
 - `hard_billing_suspension`: `1.0`
+- `frontier_incident_rollout`: `1.0`
 - `frontier_discount_rollup`: `1.0`
 - average score: `1.0`
 

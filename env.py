@@ -31,7 +31,7 @@ class CodeReviewEnv:
             self._task_index = (self._task_index + 1) % len(self._task_order)
         variant_index = self._task_variant_index.get(task_id, 0)
         self._task = get_task(task_id, variant_index=variant_index)
-        self._task_variant_index[task_id] = (variant_index + 1) % get_task_variant_count(task_id)
+        self._task_variant_index[task_id] = variant_index + 1
         self._state = EnvironmentState(
             episode_id=str(uuid.uuid4()),
             task_id=self._task.task_id,
@@ -162,6 +162,10 @@ class CodeReviewEnv:
                 reward_value -= 0.5
                 reason_parts.append("approved a buggy pull request")
                 mistakes.append("approved buggy code")
+            elif not self._task.bug_present:
+                reward_components["correct_approval"] = 0.8
+                reward_value += 0.8
+                reason_parts.append("correctly approved a behavior-preserving pull request")
             else:
                 reason_parts.append("approved the pull request")
 
@@ -203,6 +207,11 @@ class CodeReviewEnv:
                 reward_components["fully_correct_review"] = reward_components.get("fully_correct_review", 0.0) + 1.0
                 reward_value += 1.0
                 reason_parts.append("completed a fully correct review")
+        elif self._state.done and self._state.final_decision == ActionType.APPROVE_PR.value:
+            if not self._task.bug_present:
+                reward_components["fully_correct_review"] = reward_components.get("fully_correct_review", 0.0) + 0.6
+                reward_value += 0.6
+                reason_parts.append("completed a correct approval review")
 
         if self._state.step_count >= self.max_steps:
             self._state.done = True
