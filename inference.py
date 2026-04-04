@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -12,6 +13,7 @@ from grader import bug_identification_matches, validate_fix_patch
 
 DEFAULT_ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
+DEFAULT_BENCHMARK = os.getenv("BENCHMARK", "ai-code-review-env")
 MAX_STEPS = 6
 TEMPERATURE = 0.0
 
@@ -457,62 +459,86 @@ def choose_safe_action(
         try:
             action = choose_recovery_action(observation, step_index)
             if not strict_validation_enabled() or step_index != 1 or model_action_is_usable(action, observation, step_index):
-                print(f"Step {step_index + 1}: recovery fallback ({error_summary})")
+                print(f"Step {step_index + 1}: recovery fallback ({error_summary})", file=sys.stderr)
                 return action
         except Exception as recovery_exc:
-            print(f"Step {step_index + 1}: recovery action failed ({summarize_exception(recovery_exc)})")
-        print(f"Step {step_index + 1}: recovery fallback ({error_summary})")
+            print(
+                f"Step {step_index + 1}: recovery action failed ({summarize_exception(recovery_exc)})",
+                file=sys.stderr,
+            )
+        print(f"Step {step_index + 1}: recovery fallback ({error_summary})", file=sys.stderr)
         return choose_heuristic_action(observation, step_index)
 
 
-def run_episode(http_client: httpx.Client, task_id: str, use_model: bool, llm_client: Optional[OpenAI]) -> Dict[str, Any]:
+def format_action_for_log(action: Dict[str, str]) -> str:
+    action_type = action.get("action_type", "")
+    content = (action.get("content") or "").replace("\n", "\\n")
+    return f"{action_type}({json.dumps(content, ensure_ascii=True)})"
+
+
+def print_start(task_id: str, benchmark: str, model_name: str) -> None:
+    print(f"[START] task={task_id} env={benchmark} model={model_name}")
+
+
+def print_step(step_number: int, action: Dict[str, str], reward: float, done: bool, error: Optional[str]) -> None:
+    error_value = error if error else "null"
+    done_value = str(done).lower()
+    print(
+        f"[STEP] step={step_number} action={format_action_for_log(action)} "
+        f"reward={reward:.2f} done={done_value} error={error_value}"
+    )
+
+
+def print_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_text = ",".join(f"{reward:.2f}" for reward in rewards)
+    success_value = str(success).lower()
+    print(f"[END] success={success_value} steps={steps} score={score:.2f} rewards={rewards_text}")
+
+
+def run_episode(
+    http_client: httpx.Client,
+    task_id: str,
+    use_model: bool,
+    llm_client: Optional[OpenAI],
+    benchmark: str,
+    model_name: str,
+) -> Dict[str, Any]:
     reset_response = http_client.post("/reset", json={"task_id": task_id})
     reset_response.raise_for_status()
     observation = reset_response.json()["observation"]
     trajectory: List[Dict[str, Any]] = []
-    strong_patch_completed = False
+    rewards: List[float] = []
+    grade: Optional[Dict[str, Any]] = None
+    print_start(task_id, benchmark, model_name)
 
-    for step_index in range(MAX_STEPS):
-        if strong_patch_completed and observation.get("task_id") != "medium_receipt_format_cleanup":
-            action = {
-                "action_type": "request_changes",
-                "content": "The pull request introduces a bug and should not be approved until the fix is applied.",
-            }
-        else:
+    try:
+        for step_index in range(MAX_STEPS):
             action = choose_safe_action(observation, step_index, use_model, llm_client)
+            step_response = http_client.post("/step", json=action)
+            step_response.raise_for_status()
+            payload = step_response.json()
+            reward_value = float(payload["reward"]["value"])
+            done = bool(payload["done"])
+            last_action_error = payload.get("info", {}).get("last_action_error")
+            trajectory.append({"action": action, "reward": reward_value})
+            rewards.append(reward_value)
+            print_step(step_index + 1, action, reward_value, done, last_action_error)
+            observation = payload["observation"]
+            if done:
+                break
 
-        if step_index == 1:
-            try:
-                if strict_validation_enabled() and not model_action_is_usable(action, observation, step_index):
-                    action = choose_recovery_action(observation, step_index)
-            except Exception:
-                action = choose_heuristic_action(observation, 2)
-            action["action_type"] = "suggest_fix"
-        elif step_index == 2:
-            action["action_type"] = "request_changes"
-
-        step_response = http_client.post("/step", json=action)
-        step_response.raise_for_status()
-        payload = step_response.json()
-        trajectory.append({"action": action, "reward": payload["reward"]["value"]})
-        observation = payload["observation"]
-        if action["action_type"] == "suggest_fix" and payload["reward"]["value"] > 0:
-            strong_patch_completed = True
-        print(
-            f"Step {step_index + 1}: {action['action_type']} -> reward {payload['reward']['value']:+.2f} | done={payload['done']}"
-        )
-        if payload["done"]:
-            break
-
-    grader_response = http_client.post("/grader", json={})
-    grader_response.raise_for_status()
-    grade = grader_response.json()
-    return {
-        "task_id": task_id,
-        "score": grade["score"],
-        "components": grade["components"],
-        "trajectory": trajectory,
-    }
+        grader_response = http_client.post("/grader", json={})
+        grader_response.raise_for_status()
+        grade = grader_response.json()
+        return {
+            "task_id": task_id,
+            "score": grade["score"],
+            "components": grade["components"],
+            "trajectory": trajectory,
+        }
+    finally:
+        score = float(grade["score"]) if grade is not None else 0.0
+        print_end(score > 0.0, len(rewards), score, rewards)
 
 
 def run_baseline(base_url: str = DEFAULT_ENV_BASE_URL, use_model: bool = True) -> Dict[str, Any]:
@@ -531,7 +557,17 @@ def run_baseline(base_url: str = DEFAULT_ENV_BASE_URL, use_model: bool = True) -
         tasks_response = http_client.get("/tasks")
         tasks_response.raise_for_status()
         tasks = tasks_response.json()
-        results = [run_episode(http_client, task["task_id"], use_model, llm_client) for task in tasks]
+        results = [
+            run_episode(
+                http_client,
+                task["task_id"],
+                use_model,
+                llm_client,
+                benchmark=DEFAULT_BENCHMARK,
+                model_name=DEFAULT_MODEL_NAME,
+            )
+            for task in tasks
+        ]
 
     average_score = round(sum(result["score"] for result in results) / len(results), 4)
     return {"results": results, "average_score": average_score}
@@ -540,7 +576,7 @@ def run_baseline(base_url: str = DEFAULT_ENV_BASE_URL, use_model: bool = True) -
 def main() -> None:
     base_url = os.getenv("ENV_BASE_URL", DEFAULT_ENV_BASE_URL)
     result = run_baseline(base_url=base_url, use_model=True)
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2), file=sys.stderr)
 
 
 if __name__ == "__main__":

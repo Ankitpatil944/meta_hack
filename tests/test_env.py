@@ -3,6 +3,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fastapi.testclient import TestClient
+
+from app import app
 from env import CodeReviewEnv
 from grader import bug_identification_matches, validate_fix_patch
 from inference import choose_recovery_action, choose_safe_action, model_action_is_usable
@@ -400,3 +403,23 @@ merged[flag_name] = value
         inference_module.call_model = original_call_model
 
     assert "merged[flag_name] = value" in action["content"]
+
+
+def test_api_sessions_isolate_environment_state() -> None:
+    client = TestClient(app)
+
+    reset_a = client.post("/reset", json={"task_id": "easy_keyword_preview"}, headers={"X-Session-Id": "session-a"})
+    reset_b = client.post("/reset", json={"task_id": "medium_job_retry"}, headers={"X-Session-Id": "session-b"})
+
+    assert reset_a.status_code == 200
+    assert reset_b.status_code == 200
+    assert reset_a.json()["observation"]["task_id"] == "easy_keyword_preview"
+    assert reset_b.json()["observation"]["task_id"] == "medium_job_retry"
+
+    state_a = client.get("/state", headers={"X-Session-Id": "session-a"})
+    state_b = client.get("/state", headers={"X-Session-Id": "session-b"})
+
+    assert state_a.status_code == 200
+    assert state_b.status_code == 200
+    assert state_a.json()["task_id"] == "easy_keyword_preview"
+    assert state_b.json()["task_id"] == "medium_job_retry"
